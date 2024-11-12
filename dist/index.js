@@ -29971,7 +29971,9 @@ const check = async (input) => {
     }
     catch (error) {
         // https://github.com/octokit/rest.js/issues/266
-        core.error(`failed to get a key ${input.key}: ${error.message}`);
+        if (error instanceof Error) {
+            core.error(`failed to get a key ${input.key}: ${error.message}`);
+        }
         throw error;
     }
 };
@@ -30012,7 +30014,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const main_1 = __nccwpck_require__(1730);
 try {
-    (0, main_1.run)();
+    void (0, main_1.run)();
 }
 catch (error) {
     core.setFailed(error instanceof Error ? error.message : JSON.stringify(error));
@@ -30114,41 +30116,50 @@ exports.lock = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const lib = __importStar(__nccwpck_require__(5704));
+const wait = __importStar(__nccwpck_require__(910));
+var State;
+(function (State) {
+    State[State["Locked"] = 0] = "Locked";
+    State[State["AlreadyLocked"] = 1] = "AlreadyLocked";
+})(State || (State = {}));
 const lock = async (input) => {
+    const startTime = Date.now();
+    for (;;) {
+        const result = await tryLock(input);
+        switch (result.state) {
+            case State.Locked:
+                core.info(`The key ${input.key} has been locked`);
+                return;
+            case State.AlreadyLocked:
+                core.setOutput('already_locked', true);
+                if (result.metadata) {
+                    core.info(`Metadata ${JSON.stringify(result.metadata)}`);
+                }
+                if (input.unlockWaitEnabled) {
+                    const elapsedTime = (Date.now() - startTime) / 1000; // in seconds
+                    if (elapsedTime >= input.unlockWaitTimeout) {
+                        core.setFailed(`Failed to acquire lock after waiting for ${input.unlockWaitTimeout} seconds`);
+                        return;
+                    }
+                    core.info(`Failed to acquire lock. The key ${input.key} is already locked. Retrying in ${input.unlockWaitInterval} seconds...`);
+                    await wait.wait(input.unlockWaitInterval * 1000);
+                    continue;
+                }
+                if (input.ignoreAlreadyLockedError) {
+                    core.info(`Failed to acquire lock. The key ${input.key} is already locked. Ignoring error.`);
+                    return;
+                }
+                core.setFailed(`Failed to acquire lock. The key ${input.key} is already locked`);
+                return;
+        }
+    }
+};
+exports.lock = lock;
+const tryLock = async (input) => {
     const octokit = github.getOctokit(input.githubToken);
     const branch = `${input.keyPrefix}${input.key}`;
     const ref = `heads/${branch}`;
-    let result;
-    try {
-        // Get the branch
-        result = await octokit.graphql(`query($owner: String!, $repo: String!, $ref: String!) {
-  repository(owner: $owner, name: $repo) {
-    ref(qualifiedName: $ref) {
-      prefix
-      name
-      target {
-        ... on Commit {
-          oid
-          message
-          committedDate
-          tree {
-            oid
-          }
-        } 
-      }
-    }
-  }
-}`, {
-            owner: input.owner,
-            repo: input.repo,
-            ref: branch
-        });
-    }
-    catch (error) {
-        // https://github.com/octokit/rest.js/issues/266
-        core.error(`failed to get a key ${input.key}: ${error.message}`);
-        throw error;
-    }
+    const result = await getBranch(octokit, branch, input);
     core.debug(`result: ${JSON.stringify(result)}`);
     if (!result.repository.ref) {
         // If the key doesn't exist, create the key
@@ -30167,41 +30178,21 @@ const lock = async (input) => {
             });
         }
         catch (error) {
-            if (!error.message.includes('Reference already exists')) {
-                throw error;
+            if (error instanceof Error) {
+                if (!error.message.includes('Reference already exists')) {
+                    throw error;
+                }
             }
-            core.setOutput('already_locked', true);
-            if (input.ignoreAlreadyLockedError) {
-                core.info(`Failed to acquire lock. Probably the key ${input.key} has already been locked`);
-                return;
-            }
-            throw new Error(`Failed to acquire lock. Probably the key ${input.key} has already been locked`);
+            return { state: State.AlreadyLocked };
         }
-        core.info(`The key ${input.key} has been locked`);
-        core.saveState(`got_lock`, true);
-        return;
+        return { state: State.Locked };
     }
     const metadata = lib.extractMetadata(result.repository.ref.target.message, input.key);
     switch (metadata.state) {
         case 'lock':
             // The key has already been locked
-            core.setOutput('already_locked', true);
-            if (input.ignoreAlreadyLockedError) {
-                core.info(`The key ${input.key} has already been locked
-actor: ${metadata.actor}
-datetime: ${result.repository.ref.target.committedDate}
-workflow: ${metadata.github_actions_workflow_run_url}
-message: ${metadata.message}`);
-                return;
-            }
-            core.error(`The key ${input.key} has already been locked
-actor: ${metadata.actor}
-datetime: ${result.repository.ref.target.committedDate}
-workflow: ${metadata.github_actions_workflow_run_url}
-message: ${metadata.message}`);
-            throw new Error(`The key ${input.key} has already been locked`);
-        case 'unlock':
-            // lock
+            return { metadata, state: State.AlreadyLocked };
+        case 'unlock': {
             const commit = await octokit.rest.git.createCommit({
                 owner: input.owner,
                 repo: input.repo,
@@ -30218,25 +30209,51 @@ message: ${metadata.message}`);
                 });
             }
             catch (error) {
-                if (!error.message.includes('Update is not a fast forward')) {
-                    throw error;
+                if (error instanceof Error) {
+                    if (!error.message.includes('Update is not a fast forward')) {
+                        throw error;
+                    }
                 }
-                core.setOutput('already_locked', true);
-                if (input.ignoreAlreadyLockedError) {
-                    core.info(`Failed to acquire lock. Probably the key ${input.key} has already been locked`);
-                    return;
-                }
-                throw new Error(`Failed to acquire lock. Probably the key ${input.key} has already been locked`);
+                return { metadata, state: State.AlreadyLocked };
             }
-            core.info(`The key ${input.key} has been locked`);
-            core.saveState(`got_lock`, true);
-            return;
+            return { state: State.Locked };
+        }
         default:
             throw new Error(`The state of key ${input.key} is invalid ${metadata.state}`);
     }
-    return;
 };
-exports.lock = lock;
+async function getBranch(octokit, branch, input) {
+    try {
+        return await octokit.graphql(`query($owner: String!, $repo: String!, $ref: String!) {
+repository(owner: $owner, name: $repo) {
+  ref(qualifiedName: $ref) {
+    prefix
+    name
+    target {
+      ... on Commit {
+        oid
+        message
+        committedDate
+        tree {
+          oid
+        }
+      }
+    }
+  }
+}
+}`, {
+            owner: input.owner,
+            repo: input.repo,
+            ref: branch
+        });
+    }
+    catch (error) {
+        if (error instanceof Error) {
+            core.error(`failed to get a key ${input.key}: ${error.message}`);
+        }
+        throw error;
+    }
+}
 
 
 /***/ }),
@@ -30274,11 +30291,9 @@ exports.run = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const check = __importStar(__nccwpck_require__(5883));
 const lock = __importStar(__nccwpck_require__(9188));
-const post = __importStar(__nccwpck_require__(6661));
 const unlock = __importStar(__nccwpck_require__(9799));
 const run = async () => {
-    await run_with_input({
-        post: core.getState('post'),
+    await runWithInput({
         mode: core.getInput('mode'),
         key: core.getInput('key'),
         keyPrefix: core.getInput('key_prefix'),
@@ -30287,16 +30302,14 @@ const run = async () => {
         repo: core.getInput('repo_name') ||
             (process.env.GITHUB_REPOSITORY || '').split('/')[1],
         message: core.getInput('message'),
-        ignoreAlreadyLockedError: core.getBooleanInput('ignore_already_locked_error')
+        ignoreAlreadyLockedError: core.getBooleanInput('ignore_already_locked_error'),
+        unlockWaitEnabled: core.getBooleanInput('unlock_wait_enabled'),
+        unlockWaitTimeout: Number(core.getInput('unlock_wait_timeout')) || 0,
+        unlockWaitInterval: Number(core.getInput('unlock_wait_interval')) || 0
     });
 };
 exports.run = run;
-const run_with_input = async (input) => {
-    if (input.post) {
-        post.post(input);
-        return;
-    }
-    core.saveState('post', 'true');
+const runWithInput = async (input) => {
     switch (input.mode) {
         case 'lock':
             await lock.lock(input);
@@ -30308,61 +30321,9 @@ const run_with_input = async (input) => {
             await check.check(input);
             break;
         default:
-            throw new Error(`Invalid mode: ${input.mode}`);
+            core.setFailed(`Invalid mode: ${input.mode}`);
     }
 };
-
-
-/***/ }),
-
-/***/ 6661:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.post = void 0;
-const core = __importStar(__nccwpck_require__(7484));
-const unlock_1 = __nccwpck_require__(9799);
-const post = async (input) => {
-    const gotLock = core.getState('got_lock');
-    core.debug(`got_lock: ${gotLock}`);
-    if (!core.getBooleanInput('post_unlock')) {
-        core.info('post_unlock is disabled.');
-    }
-    else if (gotLock !== 'true') {
-        core.info('skip unlocking as it failed to get a lock.');
-    }
-    else {
-        core.info('unlocking...');
-        input.mode = 'unlock';
-        await (0, unlock_1.unlock)(input);
-    }
-};
-exports.post = post;
 
 
 /***/ }),
@@ -30431,7 +30392,9 @@ const unlock = async (input) => {
     }
     catch (error) {
         // https://github.com/octokit/rest.js/issues/266
-        core.error(`failed to get a key ${input.key}: ${error.message}`);
+        if (error instanceof Error) {
+            core.error(`failed to get a key ${input.key}: ${error.message}`);
+        }
         throw error;
     }
     core.debug(`result: ${JSON.stringify(result)}`);
@@ -30442,7 +30405,7 @@ const unlock = async (input) => {
     }
     const metadata = lib.extractMetadata(result.repository.ref.target.message, input.key);
     switch (metadata.state) {
-        case 'lock':
+        case 'lock': {
             // unlock
             const commit = await octokit.rest.git.createCommit({
                 owner: input.owner,
@@ -30460,15 +30423,28 @@ const unlock = async (input) => {
                 });
             }
             catch (error) {
-                if (!error.message.includes('Update is not a fast forward')) {
-                    throw error;
+                if (error instanceof Error) {
+                    if (!error.message.includes('Update is not a fast forward')) {
+                        throw error;
+                    }
+                    core.notice(`Failed to unlock the key ${input.key}. Probably the key has already been unlocked`);
+                    return;
                 }
-                core.notice(`Failed to unlock the key ${input.key}. Probably the key has already been unlocked`);
-                return;
             }
+            await octokit.rest.git.deleteRef({
+                owner: input.owner,
+                repo: input.repo,
+                ref: ref
+            });
             core.info(`The key ${input.key} has been unlocked`);
             return;
+        }
         case 'unlock':
+            await octokit.rest.git.deleteRef({
+                owner: input.owner,
+                repo: input.repo,
+                ref: ref
+            });
             core.info(`The key ${input.key} has already been unlocked`);
             return;
         default:
@@ -30476,6 +30452,25 @@ const unlock = async (input) => {
     }
 };
 exports.unlock = unlock;
+
+
+/***/ }),
+
+/***/ 910:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.wait = wait;
+async function wait(milliseconds) {
+    return new Promise(resolve => {
+        if (isNaN(milliseconds)) {
+            throw new Error('milliseconds not a number');
+        }
+        setTimeout(() => resolve(), milliseconds);
+    });
+}
 
 
 /***/ }),

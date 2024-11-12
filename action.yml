@@ -1,4 +1,4 @@
-name: Lock Mechanism
+name: Lock Action
 description: Manage GitHub branch based lock mechanism
 author: Danil Akhtarov
 branding:
@@ -24,7 +24,7 @@ inputs:
       A lock key prefix.
       This action creates and updates the branch `${keyPrefix}${key}` for each key.
     required: false
-    default: 'lock__'
+    default: 'lock-'
   github_token:
     description: |
       GitHub Access Token.
@@ -46,16 +46,29 @@ inputs:
     description: |
       This is used to record the reason and context of lock and unlock operation.
     required: false
-  post_unlock:
-    description: |
-      If this is `true`, the lock is released in a post step.
-    default: 'false'
-    required: false
   ignore_already_locked_error:
     description: |
       If this is `true`, the action does not fail when it can't acquire the lock as the key is already being locked.
     default: 'false'
     required: false
+  unlock_wait_enabled:
+    description:
+      'Indicates whether the action should wait for the lock to be released if
+      it is already held. Set to "true" to enable waiting, or "false" to
+      immediately fail if the lock is taken. Default is "true".'
+    default: 'true'
+  unlock_wait_timeout:
+    description:
+      'Specifies the maximum time, in seconds, that the action should wait for
+      the lock to be released. This is only used if unlock_wait_enabled is set
+      to "true". Default is "10" seconds.'
+    default: '10'
+  unlock_wait_interval:
+    description:
+      'Defines the interval, in seconds, between each check to see if the lock
+      has been released. This setting is only relevant if unlock_wait_enabled is
+      set to "true". Default is "1" second.'
+    default: '1'
 outputs:
   already_locked:
     description: Whether the key is already locked
@@ -64,4 +77,3 @@ outputs:
 runs:
   using: 'node20'
   main: 'dist/index.js'
-  post: 'dist/index.js'

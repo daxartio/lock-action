@@ -1,46 +1,74 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
+import { GitHub } from '@actions/github/lib/utils'
 import * as lib from './lib'
+import * as wait from './wait'
 
-export const lock = async (input: lib.Input): Promise<any> => {
-  const octokit = github.getOctokit(input.githubToken)
+enum State {
+  Locked,
+  AlreadyLocked
+}
 
-  const branch = `${input.keyPrefix}${input.key}`
-  const ref = `heads/${branch}`
-  let result: any
-  try {
-    // Get the branch
-    result = await octokit.graphql<any>(
-      `query($owner: String!, $repo: String!, $ref: String!) {
-  repository(owner: $owner, name: $repo) {
-    ref(qualifiedName: $ref) {
-      prefix
-      name
-      target {
-        ... on Commit {
-          oid
-          message
-          committedDate
-          tree {
-            oid
+type LockResult = {
+  state: State
+  metadata?: lib.Metadata
+}
+
+export const lock = async (input: lib.Input): Promise<void> => {
+  const startTime = Date.now()
+
+  for (;;) {
+    const result = await tryLock(input)
+    switch (result.state) {
+      case State.Locked:
+        core.info(`The key ${input.key} has been locked`)
+        return
+      case State.AlreadyLocked:
+        core.setOutput('already_locked', true)
+
+        if (result.metadata) {
+          core.info(`Metadata ${JSON.stringify(result.metadata)}`)
+        }
+
+        if (input.unlockWaitEnabled) {
+          const elapsedTime = (Date.now() - startTime) / 1000 // in seconds
+          if (elapsedTime >= input.unlockWaitTimeout) {
+            core.setFailed(
+              `Failed to acquire lock after waiting for ${input.unlockWaitTimeout} seconds`
+            )
+            return
           }
-        } 
-      }
+
+          core.info(
+            `Failed to acquire lock. The key ${input.key} is already locked. Retrying in ${input.unlockWaitInterval} seconds...`
+          )
+          await wait.wait(input.unlockWaitInterval * 1000)
+          continue
+        }
+
+        if (input.ignoreAlreadyLockedError) {
+          core.info(
+            `Failed to acquire lock. The key ${input.key} is already locked. Ignoring error.`
+          )
+          return
+        }
+
+        core.setFailed(
+          `Failed to acquire lock. The key ${input.key} is already locked`
+        )
+        return
     }
   }
-}`,
-      {
-        owner: input.owner,
-        repo: input.repo,
-        ref: branch
-      }
-    )
-  } catch (error: any) {
-    // https://github.com/octokit/rest.js/issues/266
-    core.error(`failed to get a key ${input.key}: ${error.message}`)
-    throw error
-  }
+}
+
+const tryLock = async (input: lib.Input): Promise<LockResult> => {
+  const octokit = github.getOctokit(input.githubToken)
+  const branch = `${input.keyPrefix}${input.key}`
+  const ref = `heads/${branch}`
+
+  const result = await getBranch(octokit, branch, input)
   core.debug(`result: ${JSON.stringify(result)}`)
+
   if (!result.repository.ref) {
     // If the key doesn't exist, create the key
     const commit = await octokit.rest.git.createCommit({
@@ -49,6 +77,7 @@ export const lock = async (input: lib.Input): Promise<any> => {
       message: lib.getMsg(input),
       tree: lib.rootTree
     })
+
     try {
       await octokit.rest.git.createRef({
         owner: input.owner,
@@ -56,49 +85,30 @@ export const lock = async (input: lib.Input): Promise<any> => {
         ref: `refs/${ref}`,
         sha: commit.data.sha
       })
-    } catch (error: any) {
-      if (!error.message.includes('Reference already exists')) {
-        throw error
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        if (!error.message.includes('Reference already exists')) {
+          throw error
+        }
       }
-      core.setOutput('already_locked', true)
-      if (input.ignoreAlreadyLockedError) {
-        core.info(
-          `Failed to acquire lock. Probably the key ${input.key} has already been locked`
-        )
-        return
-      }
-      throw new Error(
-        `Failed to acquire lock. Probably the key ${input.key} has already been locked`
-      )
+
+      return { state: State.AlreadyLocked }
     }
-    core.info(`The key ${input.key} has been locked`)
-    core.saveState(`got_lock`, true)
-    return
+
+    return { state: State.Locked }
   }
+
   const metadata = lib.extractMetadata(
     result.repository.ref.target.message,
     input.key
   )
+
   switch (metadata.state) {
     case 'lock':
       // The key has already been locked
-      core.setOutput('already_locked', true)
-      if (input.ignoreAlreadyLockedError) {
-        core.info(`The key ${input.key} has already been locked
-actor: ${metadata.actor}
-datetime: ${result.repository.ref.target.committedDate}
-workflow: ${metadata.github_actions_workflow_run_url}
-message: ${metadata.message}`)
-        return
-      }
-      core.error(`The key ${input.key} has already been locked
-actor: ${metadata.actor}
-datetime: ${result.repository.ref.target.committedDate}
-workflow: ${metadata.github_actions_workflow_run_url}
-message: ${metadata.message}`)
-      throw new Error(`The key ${input.key} has already been locked`)
-    case 'unlock':
-      // lock
+      return { metadata, state: State.AlreadyLocked }
+
+    case 'unlock': {
       const commit = await octokit.rest.git.createCommit({
         owner: input.owner,
         repo: input.repo,
@@ -106,6 +116,7 @@ message: ${metadata.message}`)
         tree: result.repository.ref.target.tree.oid,
         parents: [result.repository.ref.target.oid]
       })
+
       try {
         await octokit.rest.git.updateRef({
           owner: input.owner,
@@ -113,28 +124,78 @@ message: ${metadata.message}`)
           ref: ref,
           sha: commit.data.sha
         })
-      } catch (error: any) {
-        if (!error.message.includes('Update is not a fast forward')) {
-          throw error
+      } catch (error: unknown) {
+        if (error instanceof Error) {
+          if (!error.message.includes('Update is not a fast forward')) {
+            throw error
+          }
         }
-        core.setOutput('already_locked', true)
-        if (input.ignoreAlreadyLockedError) {
-          core.info(
-            `Failed to acquire lock. Probably the key ${input.key} has already been locked`
-          )
-          return
-        }
-        throw new Error(
-          `Failed to acquire lock. Probably the key ${input.key} has already been locked`
-        )
+
+        return { metadata, state: State.AlreadyLocked }
       }
-      core.info(`The key ${input.key} has been locked`)
-      core.saveState(`got_lock`, true)
-      return
+
+      return { state: State.Locked }
+    }
     default:
       throw new Error(
         `The state of key ${input.key} is invalid ${metadata.state}`
       )
   }
-  return
+}
+
+interface BranchData {
+  repository: {
+    ref: {
+      prefix: string
+      name: string
+      target: {
+        oid: string
+        message: string
+        committedDate: string
+        tree: {
+          oid: string
+        }
+      }
+    } | null
+  }
+}
+
+async function getBranch(
+  octokit: InstanceType<typeof GitHub>,
+  branch: string,
+  input: lib.Input
+): Promise<BranchData> {
+  try {
+    return await octokit.graphql<BranchData>(
+      `query($owner: String!, $repo: String!, $ref: String!) {
+repository(owner: $owner, name: $repo) {
+  ref(qualifiedName: $ref) {
+    prefix
+    name
+    target {
+      ... on Commit {
+        oid
+        message
+        committedDate
+        tree {
+          oid
+        }
+      }
+    }
+  }
+}
+}`,
+      {
+        owner: input.owner,
+        repo: input.repo,
+        ref: branch
+      }
+    )
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      core.error(`failed to get a key ${input.key}: ${error.message}`)
+    }
+
+    throw error
+  }
 }

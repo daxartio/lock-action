@@ -2,12 +2,10 @@ import * as core from '@actions/core'
 import * as check from './check'
 import * as lib from './lib'
 import * as lock from './lock'
-import * as post from './post'
 import * as unlock from './unlock'
 
 export const run = async (): Promise<void> => {
-  await run_with_input({
-    post: core.getState('post'),
+  await runWithInput({
     mode: core.getInput('mode'),
     key: core.getInput('key'),
     keyPrefix: core.getInput('key_prefix'),
@@ -20,16 +18,14 @@ export const run = async (): Promise<void> => {
     message: core.getInput('message'),
     ignoreAlreadyLockedError: core.getBooleanInput(
       'ignore_already_locked_error'
-    )
+    ),
+    unlockWaitEnabled: core.getBooleanInput('unlock_wait_enabled'),
+    unlockWaitTimeout: Number(core.getInput('unlock_wait_timeout')) || 0,
+    unlockWaitInterval: Number(core.getInput('unlock_wait_interval')) || 0
   })
 }
 
-const run_with_input = async (input: lib.Input): Promise<void> => {
-  if (input.post) {
-    post.post(input)
-    return
-  }
-  core.saveState('post', 'true')
+const runWithInput = async (input: lib.Input): Promise<void> => {
   switch (input.mode) {
     case 'lock':
       await lock.lock(input)
@@ -41,6 +37,6 @@ const run_with_input = async (input: lib.Input): Promise<void> => {
       await check.check(input)
       break
     default:
-      throw new Error(`Invalid mode: ${input.mode}`)
+      core.setFailed(`Invalid mode: ${input.mode}`)
   }
 }
